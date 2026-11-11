@@ -202,6 +202,8 @@ describe('Document Picture-in-Picture detection', () => {
 
   beforeEach(() => {
     vi.stubGlobal('MediaStream', TestMediaStream);
+    // happy-dom only loads iframe pages when enabled, and its default is off.
+    window.happyDOM.settings.enableIframePageLoading = true;
     documentPiP = new FakeDocumentPictureInPicture();
     (window as any).documentPictureInPicture = documentPiP;
     // The opener tab is backgrounded in every case, so pauseVideoInBackground (on by default)
