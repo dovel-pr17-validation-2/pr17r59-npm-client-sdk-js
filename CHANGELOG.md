@@ -1,5 +1,49 @@
 # Change Log
 
+## 2.24.0
+
+### Minor Changes
+
+- Split `Room` into `CoreRoom` plus extensions. `createRoom(options, [extensions])` from `livekit-client/core` builds a room with only the extensions an application needs; `e2ee`, `frameMetadata` and `dataStreams` take their options directly. `Room.dispose()` releases a room for good. Video publishing (camera, screen share, simulcast, SVC, backup codecs) is the `video` extension; receiving video stays in core. The new `livekit-client/core` entry (ESM only, experimental) exports `CoreRoom` and the extensions. `simulateParticipants` and the legacy chat messages are extensions too; the core entry does not offer legacy chat.
+
+### Patch Changes
+
+- If the server disconnects the participant while `room.connect()` is still waiting for the transports (e.g. a `DUPLICATE_IDENTITY` leave), the connection attempt is now cancelled. Previously it kept waiting until `peerConnectionTimeout`, then failed over to another region and rejoined with the same token after the room had already emitted `Disconnected`; `room.disconnect()` could not stop it because the room already looked disconnected.
+
+- Cancel an incoming data stream when its reader stops early (an aborted `signal`, a `break` out of `for await`, or a read error), so the stream is unregistered and later packets for it are dropped instead of buffering until the trailer arrives. A reader can no longer resume a stream after leaving its iteration early.
+
+- add datatrack data channel to sync state info
+
+- Fix data packet decryption after the sender ratchets its key: `DataCryptor` now retries with the ratcheted key instead of the stored one
+
+- Mark data track unpublished after republish fail
+
+- Fix an unhandled promise rejection when the signal passed to `dataTracks.getDeferred()` aborts, even though the caller catches the rejected promise.
+
+- Keep the H.264 PPS id readable in E2EE keyframes, so that Chrome no longer drops keyframes from encoders such as Intel Quick Sync
+
+- Speed up the emulation prevention step for encrypted H.264 and H.265 frames. `writeRbsp` now returns the input unchanged when no byte needs escaping, and otherwise copies runs of bytes instead of building a JS array. The output does not change.
+
+- Fixes an issue where if a data stream runs into a terminal error, any packets delivered afterwards will be treated as if the stream doesn't exist (and not throw a sync error)
+
+- Apply the `peerConnectionTimeout` connect option to the negotiation deadline
+
+- fix published type declarations for consumers with `skipLibCheck: false` or `exactOptionalPropertyTypes`
+
+- Stop logging `error reading from signal stream` at error level when the signal socket was closed by the client or replaced; the read failure is now logged at debug level with the ignored close
+
+- Emit `Reconnected` once and keep room metadata and recording changes when a full reconnect fails over to another region
+
+- Fix dynacast never pausing video layers on React Native: save sender encodings before skipping the stats monitor
+
+- Ignore signal messages received after the WebSocket is closed on React Native
+
+- Keep the mid to track id mapping of the current publisher answer when an answer to an older offer or an answer with an empty mapping arrives in single peer connection mode, so remote tracks whose `track` event fires later are no longer dropped
+
+- If `room.disconnect()` runs during the signal join, the connection attempt now rejects as cancelled instead of with a `TypeError`. A stale connection attempt no longer closes the engine of a newer connection or disconnects the room.
+
+- Fix `TokenSource` caching: a failed fetch no longer leaves the previous response cached under the new options, and `participantAttributes` is compared by content
+
 ## 2.23.0
 
 ### Minor Changes
