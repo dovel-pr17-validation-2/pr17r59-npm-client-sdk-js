@@ -1,0 +1,227 @@
+> Note for agents: If you discover useful context about this codebase during a conversation —
+> architectural patterns, naming conventions, API design decisions, gotchas — please add it
+> to this file in the background so future agent interactions benefit from the knowledge.
+
+## Project overview
+
+This is the LiveKit client SDK for JavaScript/TypeScript (`livekit-client`). It provides the
+browser-side implementation for connecting to LiveKit rooms and interacting with
+audio, video, data streams, data tracks, and RPC.
+
+## Key concepts
+
+### Room and participants
+
+A `Room` is the central object. It connects to a LiveKit server and exposes `localParticipant`
+(the current user) and `remoteParticipants` (everyone else). Room events (`RoomEvent.*`) are
+the primary way to react to state changes — tracks published, participants joining/leaving, etc.
+
+Important: event handlers should be registered **before** calling `room.connect()` because some
+events (like `DataTrackPublished`) fire during the connection handshake.
+
+When changing full reconnects, carry the attempt's `AbortSignal` through joins and region
+selection. Cancellation must cover continuations after awaited cleanup and late join responses:
+engine close removes room listeners, so room-event guards cannot catch those continuations.
+Regression tests live in `RTCEngine.test.ts` and `SignalClient.test.ts`.
+
+Each region attempt of a full reconnect has its own `AbortSignal`, passed as the second argument of
+`EngineEvent.SignalRestarted`. The engine aborts it when the next attempt begins (next region or a
+later restart) and on close. `CoreRoom.handleSignalRestarted` awaits a republish, so it checks that
+signal before it reports the recovery. Failover regression tests live in `Room.test.ts`.
+
+### Data transport APIs
+
+LiveKit has four data transport mechanisms, each suited to different patterns:
+
+- **Data packets** — one-shot messages, reliable or lossy delivery
+- **Text streams / byte streams** — finite reliable streams (chat, file transfer, LLM responses)
+- **RPC** — request-response over the room
+- **Data tracks** — continuous unreliable streams for real-time data (sensor telemetry, robot
+  teleoperation). This is the newest addition.
+
+### Data tracks architecture
+
+Data tracks have a **publish side** (LocalDataTrack) and a **subscribe side** (RemoteDataTrack).
+The publish/subscribe lifecycle is managed by `OutgoingDataTrackManager` and
+`IncomingDataTrackManager` respectively.
+
+Key design decisions:
+- `RemoteDataTrack.subscribe()` is **synchronous** — it returns a `ReadableStream` immediately.
+  The SFU subscription is initiated lazily inside the stream's `start` callback.
+- The `subscribe()` signal parameter follows the **fetch API pattern**: a single `AbortSignal`
+  controls both the pending SFU negotiation phase and the active streaming phase.
+- Each subscription has an internal frame buffer. When the buffer fills, new frames are dropped
+  (not queued infinitely). Buffer size is configurable via `subscribe({ bufferSize })`.
+- `openSubscriptionStream()` on the manager returns a tuple:
+  `[ReadableStream, Promise<void>]` where the promise resolves when the SFU subscription is
+  fully established. This is primarily useful for tests.
+
+### Data streams (text/byte streams)
+
+Data stream readers (`ByteStreamReader`, `TextStreamReader`) implement async iteration with
+abort signal support. They extend a `BaseStreamReader` base class. The `withAbortSignal()`
+method on these readers is `@internal` — it exists for `readAll()` but is not meant as
+user-facing API.
+
+## Build and test
+
+- **Type check:** `npx tsc --noEmit`
+- **Run all tests:** `npx vitest run`
+- **Run specific test file:** `npx vitest run path/to/file.test.ts`
+- **Format:** `npm run format`
+- **Published types:** `pnpm check:published-types` (after `pnpm build`) installs the packed tarball
+  into a temp project outside the repo and type-checks every entry with `skipLibCheck` off and
+  `exactOptionalPropertyTypes` on. Declarations must name only packages in `dependencies`, and their
+  `@types/*` packages must be there too. Import `Throws` from `src/utils/throws.ts`, never from
+  `@livekit/throws-transformer` (a devDependency). If `dist` still shows an old inferred type after
+  a type-only change, delete `node_modules/.cache/rollup-plugin-typescript2`: its cache misses those.
+
+## Examples
+
+Standalone example apps live in `examples/`. Each has its own `package.json`, `vite.config.js`,
+and an Express API backend (`api.ts`) for token generation via `vite-plugin-mix`. To run one:
+
+```
+cd examples/<name>
+pnpm install
+pnpm dev
+```
+
+The main demo app (`examples/demo/`) is a comprehensive kitchen-sink UI. Standalone examples
+(`examples/rpc/`, `examples/data-tracks/`) focus on individual features.
+
+## Room extensions
+
+`Room` (the main export) is `CoreRoom` plus every extension, installed in its constructor through
+`installExtensions()`. The core entry's `createRoom(options, [extensions])` does the same with the
+list an app gives it.
+`CoreRoom` (`src/room/CoreRoom.ts`) holds the signal client, engine, participants, media and
+raw data packets. Everything else is a `RoomExtension` (`src/room/extensions.ts`) that
+`installExtensions()` installs right after construction. `src/exports.ts` is the export surface both
+entries share; `src/index.ts` adds `Room` and the type augmentations, `src/core.ts` adds
+`CoreRoom` and the extension objects (`livekit-client/core`, experimental). The core entry is
+built per module with dependencies external (`dist/core/`), so a consumer's bundler drops unused
+modules whole; the main entry stays one self-contained bundle. `pnpm check:core` fails if
+`CoreRoom` alone bundles an extension module, and `pnpm size-limit` tracks both entries.
+
+- An extension is a plain object: `key`, optional `requires` (hard dependencies, installed first,
+  deduped by key), and `install(room, ctx)`. It lives in `extension.ts` next to its managers.
+- `install` returns an intersection of small interfaces, and each extension declares exactly the
+  ones it uses as its return type, so a missing API or an undeclared contribution is a type
+  error: `RoomApiProvider<RoomApi>` (`room`, copied onto the room), `LocalParticipantApiProvider<LocalParticipantApi>`
+  (`localParticipant`, copied onto the local participant), `Disposable`, `EngineHooks`
+  (`onEngineCreated`), `ConnectionHooks` (`onDisconnect`), `ParticipantHooks`, `DataPacketOwner`
+  (`dataPackets`, one owner per case), `SyncStateProvider`, and `SlotProvider<K>` for the values
+  core reads (`Pick<CoreSlots, K>`; `dataStreams` is a `SlotProvider<'byteStreamOpener'>`). The
+  slots are one keyed store: a new one is a documented member of `CoreSlots`, its key in
+  `SLOT_KEYS` (core copies those off every result), and the read in core. A provider whose value
+  is conditional declares `Partial<SlotProvider<...>>` (`e2ee` without options). Rule for a new
+  interface: one per capability, named for what core does with it, `*Provider` for a value core
+  reads, `*Hooks` for a moment core calls, `*Owner` for an exclusive claim. `ExtensionResult` is the union of all of them, optional, for the resolver.
+  Extra members (the managers) are visible to dependents through `ctx.get(extension)`. The
+  room's typing (`ExtensionApis`) comes from the `RoomExtension<RoomApi, LocalParticipantApi>` generics
+  pinned with `satisfies`, not from the result. Nothing registers on `ExtensionContext`; it
+  offers `log`, `get`, `slot` and the two privileged operations.
+- Extensions that take options (`e2ee`, `frameMetadata`, `dataStreams`) are built with
+  `defineExtension()` and are callable: listed bare they read today's `RoomOptions`, called with
+  options they use those, and a function is evaluated per room. Extensions without options are
+  plain objects. The resolver dedupes by key, installs dependencies first, lets an explicitly listed
+  instance win over a dependency's default, and throws when a key is listed twice.
+- `install`, `dispose` and every hook are synchronous. Async setup starts in `install` and is
+  awaited in the extension's own methods.
+- Core never reads an extension's slice of the room options (`e2ee`, `encryption`,
+  `frameMetadata`, `packetTrailer`, `dataStream`): a configured extension (`e2ee({ ... })`) does not
+  write them. What core needs comes through a provider member of the install result
+  (`e2eeManager: manager`), which the extension fills from its own options or, when listed bare, from
+  `RoomOptions`. Every slot of the list is filled before the first `onEngineCreated` runs, so an
+  extension that depends on another's slot reads `ctx.slot()` there. `pnpm check:core` greps the
+  modules for reads of another extension's slice.
+- A worker an app supplies to an extension is terminated in the extension's `dispose`, not on
+  disconnect: the room can connect again after a disconnect. The exception is a manager the app
+  passes in (`e2eeManager`): it can be shared between rooms, so the extension neither disposes
+  nor terminates it.
+- Core calls out through the install result's hooks only. The engine is replaced after a close,
+  so register engine listeners in `onEngineCreated`. Prefer an existing `RoomEvent` over a new
+  hook; a new hook is an optional member on one of the small interfaces plus a loop over
+  `extensionResults` in `CoreRoom`.
+- The full entry (`src/room/Room.ts`) augments `CoreRoom` and `LocalParticipant` with the
+  extension API interfaces via `declare module`, so the full build keeps its types wherever those
+  classes appear. Inside the SDK's own compilation this means core code can call extension
+  methods without a type error; `pnpm check:core` is the guard.
+- Extension method bodies must be closures over the managers, never `this`-based: they are
+  copied onto instances with `Object.defineProperties`.
+- The core declarations (`dist/core/types`) come from a program rooted at `src/core.ts`
+  (rollup `files: ['src/core.ts']`), so `src/index.ts` and its `declare module` augmentations are
+  not in it. That is the guard against the augmentations reaching a core consumer: tsc's
+  declaration emitter writes `import("../..")` for an inferred type whenever the index barrel is
+  in its program, and that import would type a `[rpc]` room as if every extension were installed.
+  Still, never import types from the barrel (`'../..'`, `'.'`) inside `src`. Inferred types on
+  exported values are fine. `pnpm check:core` compiles a consumer probe against declarations
+  emitted the same way and fails on a leak or a dangling reference.
+- The core build emits its own declarations with `stripInternal` (`dist/core/types`); the main
+  entry keeps `@internal` members because components-js and React Native use some of them. Every
+  symbol a public signature names must therefore stay untagged (`ExtensionContext`,
+  `InternalRoomOptions`, the `RTCEngine` class), or the stripped declaration dangles. Tag members,
+  not the classes and interfaces that public types mention. `pnpm check:core` type-checks the
+  stripped declarations with `skipLibCheck` off and fails on a dangling reference.
+- Operations that exist only for extensions live on `ExtensionContext`, not on `CoreRoom`:
+  `getOrCreateParticipant()` and `simulateConnected()`. The room keeps the slots in one
+  `Partial<CoreSlots>` object that it hands to `LocalParticipant` (the `byteStreamOpener` for the
+  preconnect audio buffer, the `videoPublisher`). `installExtensions()` is the only `@internal`
+  member `CoreRoom` has for extensions.
+- `Room.dispose()` disconnects, runs extension `dispose` in reverse order and removes the
+  `devicechange` listener. A disposed room cannot connect again.
+- `simulateParticipants` is the `simulatedParticipants` extension (`src/room/simulated-participants/`);
+  it uses `ctx.simulateConnected()` and `ctx.getOrCreateParticipant()`.
+  `simulateScenario` stays in core. The legacy chat packets (`sendChatMessage`,
+  `RoomEvent.ChatMessage`) are the `chat` extension (`src/room/chat/`): the full `Room` installs it,
+  the core entry does not export it because text streams supersede it.
+- Video publishing is the `video` extension (`src/room/video/`). Receiving video stays in core.
+  Core keeps type guards (`isLocalVideoTrack`) and instance method calls on video tracks, which
+  cost nothing; it must not import `LocalVideoTrack`, `publishUtils` or `facingMode` as values.
+  Two slots connect them: the `videoPublisher` slot on the local participant (the publish
+  pipeline for a video track: codec, encodings, layers, start bitrate, server codec fallback,
+  screen capture, the `videoPublisher` slot of the install result) and `setVideoCapture()` in
+  `track/create.ts` (how `createLocalTracks` builds a video track). The
+  full entry calls `registerVideoCapture()` at module load so `createLocalTracks({ video })` works
+  before any Room exists.
+
+## Manager pattern
+
+Managers (e.g. `RpcClientManager`, `RpcServerManager`, `OutgoingDataTrackManager`,
+`IncomingDataTrackManager`) follow a consistent decoupled architecture:
+
+- **No RTCEngine dependency.** Managers never import or hold a reference to `RTCEngine`.
+  - Not all managers currently abide by this, but it is a good goal for newly introduced managers
+    to follow unless it is overly burdensome.
+- **Incoming data** arrives via explicit `handle*` methods (e.g. `handleIncomingRpcAck`,
+  `handleIncomingDataStream`). `Room` parses incoming packets and calls these directly.
+- **Outgoing data** is emitted via strongly-typed events using `typed-emitter`. Managers extend
+  `(EventEmitter as new () => TypedEmitter<ManagerCallbacks>)` and `Room` subscribes to these
+  events to forward packets to the engine.
+- **External state** (e.g. remote participant protocol version, server version) is injected as
+  callbacks in the constructor, not looked up from the engine.
+- **Event types** are usually defined in an `events.ts` file alongside each manager.
+- **Directory structure** groups each manager with its events and tests:
+  `src/room/rpc/client/` contains `RpcClientManager.ts`, `events.ts`, and
+  `RpcClientManager.test.ts`.
+
+### Testing managers
+
+- Tests construct managers directly — no mock engine needed.
+- Use `subscribeToEvents<ManagerCallbacks>(manager, ['eventName'])` from
+  `src/utils/subscribeToEvents.ts` to capture emitted events. Create `managerEvents` per-test
+  (not in `beforeEach`) so the subscription list can evolve independently.
+- Call `managerEvents.waitFor('eventName')` to get emitted event payloads in order.
+- Use `managerEvents.areThereBufferedEvents('eventName')` to assert no unexpected events.
+- Prefer plain `async () => { ... }` handlers over `vi.fn().mockResolvedValue()` unless the
+  test needs to assert on call arguments.
+
+## Code style notes
+
+- The codebase uses a `@throws-transformer` that converts `throw` statements into typed error
+  return types. Panics (programmer errors) are annotated with `// @throws-transformer ignore`.
+- `Future<T, E>` is a local utility similar to a deferred promise — it exposes
+  `resolve`/`reject` callbacks and a `.promise` property.
+- Error classes use a `Reasoned` pattern: `DataTrackSubscribeError<Reason>` with a `reason` enum
+  and static factory methods (`.timeout()`, `.cancelled()`, `.disconnected()`).
